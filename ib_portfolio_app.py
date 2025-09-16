@@ -3,6 +3,7 @@
 # Shows: Issuer, Security Type, Face Value, Units, Purchase Price, Close Bid,
 # Market Value, P/L, %P/L, and a Margin summary.
 
+# ib_portfolio_app.py
 import math
 import time
 from typing import List, Dict, Any
@@ -10,13 +11,15 @@ from typing import List, Dict, Any
 import streamlit as st
 import pandas as pd
 
-# You need: pip install ib-insync streamlit pandas
-# TWS/IB Gateway must be running; API → Settings → "Enable ActiveX and Socket Clients" (socket API)
+# --- make sure an asyncio loop exists BEFORE using ib_insync ---
+import asyncio
 try:
-    from ib_insync import IB
-except Exception:
-    st.error("ib_insync is required. Install with: pip install ib-insync")
-    raise
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+from ib_insync import IB, util
+# util.startLoop()  # <- you can call this too; harmless if loop already set
 
 st.set_page_config(page_title="IBKR Portfolio (TWS API)", layout="wide")
 st.title("Firstline – Fixed Income Portfolio (IBKR)")
@@ -216,3 +219,4 @@ if st.session_state.connected:
             st.experimental_rerun()
 else:
     st.info("Connect to TWS/Gateway (left sidebar) to load data.")
+

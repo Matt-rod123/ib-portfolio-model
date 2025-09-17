@@ -21,6 +21,18 @@ Security note: set IB connection params from environment variables when deployin
 (IB_HOST, IB_PORT, IB_CLIENT_ID). On Streamlit Cloud or your own server, run an
 IB Gateway alongside the app (same private network) so the socket is reachable.
 """
+import asyncio
+
+# Create and set a loop before importing ib_insync/eventkit
+try:
+    asyncio.get_running_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+from ib_insync import IB, Bond, util
+util.patchAsyncio()
+
 from __future__ import annotations
 
 import math
@@ -33,12 +45,6 @@ import numpy as np
 import pandas as pd
 from dateutil.relativedelta import relativedelta
 import streamlit as st
-
-# Prefer ib_insync for a clean async wrapper around TWS API
-from ib_insync import IB, Bond, util
-# Ensure an asyncio event loop exists for Streamlit / Py ≥3.11
-# This prevents "There is no current event loop in thread" from eventkit/asyncio
-util.patchAsyncio()
 
 # ----------------------------
 # UI CONFIG

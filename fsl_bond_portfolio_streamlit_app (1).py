@@ -15,6 +15,11 @@ from datetime import date
 import numpy as np
 import pandas as pd
 import streamlit as st
+# Optional Plotly (legacy). Safe import so missing package won't crash.
+try:
+    import plotly.express as px  # noqa: F401
+except Exception:
+    px = None
 import plotly.express as px
 
 import asyncio

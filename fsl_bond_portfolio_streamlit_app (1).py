@@ -138,11 +138,26 @@ def safe_weighted_avg(values, weights, default=np.nan):
 import altair as alt
 
 # Header KPIs
+# Safe numeric helpers for KPIs
+def _num_series(df, col):
+    s = df[col] if col in df.columns else pd.Series(dtype=float)
+    return pd.to_numeric(s, errors='coerce')
+
+def fmt_money(x):
+    return "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"${x:,.2f}"
+
+def fmt_pct(x):
+    return "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x:.2f}%"
+
+mv_s = _num_series(out_df, 'Market_Value')
+pl_s = _num_series(out_df, 'Dollar_PL')
+ytm_s = _num_series(out_df, 'BidYTM')
+
 colK1, colK2, colK3, colK4 = st.columns(4)
-colK1.metric("Total Market Value", f"${out_df['Market_Value'].sum(skipna=True):,.2f}")
-colK2.metric("Total $ P/L", f"${out_df['Dollar_PL'].sum(skipna=True):,.2f}")
-colK3.metric("Avg Bid YTM", f"{out_df['BidYTM'].mean(skipna=True):.2f}%")
-wd = safe_weighted_avg(out_df['Duration'], out_df['Market_Value'])
+colK1.metric("Total Market Value", fmt_money(float(mv_s.sum()) if not mv_s.empty else float('nan')))
+colK2.metric("Total $ P/L", fmt_money(float(pl_s.sum()) if not pl_s.empty else float('nan')))
+colK3.metric("Avg Bid YTM", fmt_pct(float(ytm_s.mean()) if not ytm_s.empty else float('nan')))
+wd = safe_weighted_avg(out_df['Duration'] if 'Duration' in out_df.columns else pd.Series(dtype=float), mv_s)
 colK4.metric("Weighted Duration", "—" if pd.isna(wd) else f"{wd:.2f}y")
 
 # Filters
@@ -305,18 +320,22 @@ with tab4:
 with st.expander("Totals & Averages", expanded=True):
     cols = st.columns(4)
     with cols[0]:
-        st.metric("Total Market Value", f"${out_df['Market_Value'].sum(skipna=True):,.2f}")
-        st.metric("Total Invested", f"${out_df['Invested'].sum(skipna=True):,.2f}")
+        st.metric("Total Market Value", fmt_money(float(mv_s.sum()) if not mv_s.empty else float('nan')))
+        invested_s = _num_series(out_df, 'Invested')
+        st.metric("Total Invested", fmt_money(float(invested_s.sum()) if not invested_s.empty else float('nan')))
     with cols[1]:
-        st.metric("Total $ P/L", f"${out_df['Dollar_PL'].sum(skipna=True):,.2f}")
-        st.metric("Avg % P/L", f"{out_df['Percent_PL'].mean(skipna=True):.2f}%")
+        st.metric("Total $ P/L", fmt_money(float(pl_s.sum()) if not pl_s.empty else float('nan')))
+        pctpl_s = _num_series(out_df, 'Percent_PL')
+        st.metric("Avg % P/L", fmt_pct(float(pctpl_s.mean()) if not pctpl_s.empty else float('nan')))
     with cols[2]:
-        st.metric("Avg Purch YTM", f"{out_df['PurchYTM'].mean(skipna=True):.2f}%")
-        st.metric("Avg Bid YTM", f"{out_df['BidYTM'].mean(skipna=True):.2f}%")
+        purch_s = _num_series(out_df, 'PurchYTM')
+        st.metric("Avg Purch YTM", fmt_pct(float(purch_s.mean()) if not purch_s.empty else float('nan')))
+        st.metric("Avg Bid YTM", fmt_pct(float(ytm_s.mean()) if not ytm_s.empty else float('nan')))
     with cols[3]:
-        st.metric("Portfolio DV01 (per 100)", f"${out_df['DV01'].sum(skipna=True):,.2f}")
-        wd2 = safe_weighted_avg(out_df['Duration'], out_df['Market_Value'])
-st.metric("Weighted Duration", "—" if pd.isna(wd2) else f"{wd2:.2f}y")
+        dv01_s = _num_series(out_df, 'DV01')
+        st.metric("Portfolio DV01 (per 100)", fmt_money(float(dv01_s.sum()) if not dv01_s.empty else float('nan')))
+        wd2 = safe_weighted_avg(out_df['Duration'] if 'Duration' in out_df.columns else pd.Series(dtype=float), mv_s)
+        st.metric("Weighted Duration", "—" if pd.isna(wd2) else f"{wd2:.2f}y")
 
 csv = styled.to_csv(index=False).encode("utf-8")
 st.download_button("Download table as CSV", data=csv, file_name=f"fsl_bond_portfolio_{date.today()}.csv")

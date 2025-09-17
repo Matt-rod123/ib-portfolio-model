@@ -17,7 +17,16 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 
+import asyncio
+import nest_asyncio
+nest_asyncio.apply()
+try:
+    asyncio.get_running_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 from ib_insync import IB, Bond, util
+util.patchAsyncio()
 import asyncio
 
 # Ensure event loop exists before ib_insync/eventkit import issues
@@ -105,6 +114,22 @@ if not df.empty:
     st.subheader("Holdings")
     show_cols = ["Issuer","Security","ISIN","Units","Purchase Px","Close Bid","Invested","Market Value","P/L $","P/L %"]
     # === Nicer UI ===
+
+def safe_weighted_avg(values, weights, default=np.nan):
+    v = pd.to_numeric(values, errors='coerce')
+    w = pd.to_numeric(weights, errors='coerce')
+    if v.empty or w.empty:
+        return default
+    w = w.fillna(0)
+    total_w = float(w.sum())
+    if total_w <= 0:
+        return default
+    v = v.fillna(0)
+    try:
+        return float(np.average(v, weights=w))
+    except ZeroDivisionError:
+        return default
+
 import altair as alt
 
 # Header KPIs
@@ -112,7 +137,8 @@ colK1, colK2, colK3, colK4 = st.columns(4)
 colK1.metric("Total Market Value", f"${out_df['Market_Value'].sum(skipna=True):,.2f}")
 colK2.metric("Total $ P/L", f"${out_df['Dollar_PL'].sum(skipna=True):,.2f}")
 colK3.metric("Avg Bid YTM", f"{out_df['BidYTM'].mean(skipna=True):.2f}%")
-colK4.metric("Weighted Duration", f"{np.average(out_df['Duration'].fillna(0), weights=out_df['Market_Value'].fillna(0) + 1e-9):.2f}y")
+wd = safe_weighted_avg(out_df['Duration'], out_df['Market_Value'])
+colK4.metric("Weighted Duration", "—" if pd.isna(wd) else f"{wd:.2f}y")
 
 # Filters
 st.subheader("Filters")
@@ -284,7 +310,8 @@ with st.expander("Totals & Averages", expanded=True):
         st.metric("Avg Bid YTM", f"{out_df['BidYTM'].mean(skipna=True):.2f}%")
     with cols[3]:
         st.metric("Portfolio DV01 (per 100)", f"${out_df['DV01'].sum(skipna=True):,.2f}")
-        st.metric("Weighted Duration", f"{np.average(out_df['Duration'].fillna(0), weights=out_df['Market_Value'].fillna(0) + 1e-9):.2f}y")
+        wd2 = safe_weighted_avg(out_df['Duration'], out_df['Market_Value'])
+st.metric("Weighted Duration", "—" if pd.isna(wd2) else f"{wd2:.2f}y")
 
 csv = styled.to_csv(index=False).encode("utf-8")
 st.download_button("Download table as CSV", data=csv, file_name=f"fsl_bond_portfolio_{date.today()}.csv")

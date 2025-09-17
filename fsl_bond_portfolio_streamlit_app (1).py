@@ -105,19 +105,14 @@ if not df.empty:
     st.subheader("Holdings")
     show_cols = ["Issuer","Security","ISIN","Units","Purchase Px","Close Bid","Invested","Market Value","P/L $","P/L %"]
     # === Nicer UI ===
-
 import altair as alt
 
 # Header KPIs
 colK1, colK2, colK3, colK4 = st.columns(4)
-with colK1:
-    st.metric("Total Market Value", f"${out_df['Market_Value'].sum(skipna=True):,.2f}")
-with colK2:
-    st.metric("Total $ P/L", f"${out_df['Dollar_PL'].sum(skipna=True):,.2f}")
-with colK3:
-    st.metric("Avg Bid YTM", f"{out_df['BidYTM'].mean(skipna=True):.2f}%")
-with colK4:
-    st.metric("Weighted Duration", f"{np.average(out_df['Duration'].fillna(0), weights=out_df['Market_Value'].fillna(0) + 1e-9):.2f}y")
+colK1.metric("Total Market Value", f"${out_df['Market_Value'].sum(skipna=True):,.2f}")
+colK2.metric("Total $ P/L", f"${out_df['Dollar_PL'].sum(skipna=True):,.2f}")
+colK3.metric("Avg Bid YTM", f"{out_df['BidYTM'].mean(skipna=True):.2f}%")
+colK4.metric("Weighted Duration", f"{np.average(out_df['Duration'].fillna(0), weights=out_df['Market_Value'].fillna(0) + 1e-9):.2f}y")
 
 # Filters
 st.subheader("Filters")
@@ -138,87 +133,164 @@ if sel_alloc:
     mask &= out_df['Allocation'].isin(sel_alloc)
 flt = out_df[mask].copy()
 
+# Helper to make selection labels consistently
+def build_options_map(df: pd.DataFrame):
+    labels = (df['Issuer'].fillna('') + ' — ' + df['Security'].fillna('') + ' (' + df['ISIN'].fillna('') + ')')
+    options = labels.tolist()
+    idx_map = {opt: i for i, opt in zip(df.index.tolist(), options)}
+    # Correction: build mapping from label->row index
+    idx_map = {label: idx for label, idx in zip(options, df.index.tolist())}
+    return options, idx_map
+
 # Tabs
 tab1, tab2, tab3, tab4 = st.tabs(["Overview", "Holdings", "Risk", "Cashflows"])
 
 with tab1:
     st.caption("Portfolio overview & breakdowns")
-    # Allocation by account (bar)
-    alloc_df = flt.groupby('Account', dropna=False)['Market_Value'].sum().reset_index().sort_values('Market_Value', ascending=False)
-    chart1 = alt.Chart(alloc_df).mark_bar().encode(x=alt.X('Market_Value:Q', title='Market Value ($)'), y=alt.Y('Account:N', sort='-x'), tooltip=['Account','Market_Value']).properties(height=300)
-    st.altair_chart(chart1, use_container_width=True)
+
+    # Allocation by account
+    alloc_df = flt.groupby('Account', dropna=False)['Market_Value'].sum().reset_index()
+    if not alloc_df.empty:
+        alloc_df = alloc_df.sort_values('Market_Value', ascending=False)
+        chart1 = (
+            alt.Chart(alloc_df)
+            .mark_bar()
+            .encode(
+                x=alt.X('Market_Value:Q', title='Market Value ($)'),
+                y=alt.Y('Account:N', sort='-x'),
+                tooltip=['Account','Market_Value']
+            )
+            .properties(height=300)
+        )
+        st.altair_chart(chart1, use_container_width=True)
+    else:
+        st.info("No holdings to plot by account.")
 
     # Maturity ladder by year
     mat = flt.dropna(subset=['Maturity_Date']).copy()
     if not mat.empty:
         mat['Year'] = pd.to_datetime(mat['Maturity_Date']).dt.year
         ladder = mat.groupby('Year')['Market_Value'].sum().reset_index()
-        chart2 = alt.Chart(ladder).mark_bar().encode(x=alt.X('Year:O'), y=alt.Y('Market_Value:Q', title='Market Value ($)'), tooltip=['Year','Market_Value']).properties(height=300)
+        chart2 = (
+            alt.Chart(ladder)
+            .mark_bar()
+            .encode(
+                x=alt.X('Year:O'),
+                y=alt.Y('Market_Value:Q', title='Market Value ($)'),
+                tooltip=['Year','Market_Value']
+            )
+            .properties(height=300)
+        )
         st.altair_chart(chart2, use_container_width=True)
+    else:
+        st.info("No maturity data available.")
 
     # YTM histogram
     ytms = flt['BidYTM'].dropna()
     if not ytms.empty:
         hist = pd.DataFrame({'BidYTM': ytms})
-        chart3 = alt.Chart(hist).mark_bar().encode(alt.X('BidYTM:Q', bin=alt.Bin(maxbins=30), title='Bid YTM (%)'), y='count()').properties(height=300)
+        chart3 = (
+            alt.Chart(hist)
+            .mark_bar()
+            .encode(
+                x=alt.X('BidYTM:Q', bin=alt.Bin(maxbins=30), title='Bid YTM (%)'),
+                y=alt.Y('count():Q', title='Count')
+            )
+            .properties(height=300)
+        )
         st.altair_chart(chart3, use_container_width=True)
+    else:
+        st.info("No Bid YTM data to plot.")
 
 with tab2:
     st.caption("Clean holdings table with key columns and quick selection.")
     nice_cols = ['Issuer','Security','ISIN','Account','Allocation','Units','Purchase_Px','Close_Bid','Market_Value','Dollar_PL','Percent_PL','PurchYTM','BidYTM','Duration','DV01','Maturity_Date']
     view = flt[nice_cols].copy()
-    # Pretty labels
-    labels = {
+    view.rename(columns={
         'Purchase_Px':'Purchase Px','Close_Bid':'Bid Px','Market_Value':'Market Value',
         'Dollar_PL':'$ P/L','Percent_PL':'% P/L','PurchYTM':'Purch YTM','BidYTM':'Bid YTM',
         'Maturity_Date':'Maturity','DV01':'DV01 (per 100)'
-    }
-    view.rename(columns=labels, inplace=True)
+    }, inplace=True)
     st.dataframe(view, hide_index=True, use_container_width=True)
 
-    # Select a bond for details
     st.markdown("### Bond details")
-    options = (flt['Issuer'].fillna('') + ' — ' + flt['Security'].fillna('') + ' (' + flt['ISIN'].fillna('') + ')').tolist()
-    idx_map = {opt:i for i,opt in enumerate(options)}
+    options, idx_map = build_options_map(flt)
     choice = st.selectbox("Choose a bond", options) if options else None
     if choice:
-        r = flt.iloc[idx_map[choice]].to_dict()
+        r = flt.loc[idx_map[choice]].to_dict()
         c1, c2, c3 = st.columns(3)
-        c1.metric("Bid Px", f"{r.get('Close_Bid', float('nan')):,.2f}")
-        c2.metric("Bid YTM", f"{r.get('BidYTM', float('nan')):,.2f}%")
-        c3.metric("Duration", f"{r.get('Duration', float('nan')):,.2f}y")
+        c1.metric("Bid Px", f"{(r.get('Close_Bid') or float('nan')):,.2f}")
+        c2.metric("Bid YTM", f"{(r.get('BidYTM') or float('nan')):,.2f}%")
+        c3.metric("Duration", f"{(r.get('Duration') or float('nan')):,.2f}y")
         st.write({k: r.get(k) for k in ['Issuer','Security','ISIN','Account','Allocation','Units','Coupon','Maturity_Date','Days_to_Maturity']})
 
 with tab3:
-    st.caption("Risk lenses: DV01 and duration by holding.")
+    st.caption("Risk lenses: DV01 and Duration by holding.")
     risk = flt[['Issuer','Security','ISIN','Market_Value','Duration','DV01']].dropna(subset=['DV01']).copy()
     if not risk.empty:
         risk['AbsDV01'] = risk['DV01'] * risk['Market_Value'].fillna(0) / 100.0
         st.dataframe(risk.sort_values('AbsDV01', ascending=False), hide_index=True, use_container_width=True)
-        rchart = alt.Chart(risk).mark_bar().encode(x=alt.X('AbsDV01:Q', title='Portfolio DV01 ($ per 1bp)'), y=alt.Y('Security:N', sort='-x'), tooltip=['ISIN','AbsDV01']).properties(height=400)
+        rchart = (
+            alt.Chart(risk)
+            .mark_bar()
+            .encode(
+                x=alt.X('AbsDV01:Q', title='Portfolio DV01 ($ per 1bp)'),
+                y=alt.Y('Security:N', sort='-x'),
+                tooltip=['ISIN','AbsDV01']
+            )
+            .properties(height=400)
+        )
         st.altair_chart(rchart, use_container_width=True)
     else:
         st.info("No risk data available.")
 
 with tab4:
     st.caption("Projected fixed-coupon cashflows for a selected bond.")
-    options2 = (flt['Issuer'].fillna('') + ' — ' + flt['Security'].fillna('') + ' (' + flt['ISIN'].fillna('') + ')').tolist()
+    options2, idx_map2 = build_options_map(flt)
     pick = st.selectbox("Bond", options2, key='cf_pick') if options2 else None
     if pick:
-        r = flt.iloc[idx_map[pick]]
-        coupon_dec = (r['Coupon']/100.0) if (pd.notna(r['Coupon']) and r['Coupon']>1) else r['Coupon']
-        cf = cashflow_schedule(r['Maturity_Date'], coupon_dec if pd.notna(coupon_dec) else 0.0, 2, 100, date.today()) if pd.notna(r['Maturity_Date']) else []
-        if cf:
+        row = flt.loc[idx_map2[pick]]
+        cp = row.get('Coupon')
+        coupon_dec = (cp/100.0) if (pd.notna(cp) and cp > 1) else (cp if pd.notna(cp) else 0.0)
+        if pd.notna(row.get('Maturity_Date')):
+            cf = cashflow_schedule(row['Maturity_Date'], coupon_dec, 2, 100, date.today())
             cf_df = pd.DataFrame(cf)
             st.dataframe(cf_df, hide_index=True, use_container_width=True)
+            # Optional bar of cashflows
+            cfc = (
+                alt.Chart(cf_df)
+                .mark_bar()
+                .encode(
+                    x=alt.X('date:T', title='Payment Date'),
+                    y=alt.Y('amount:Q', title='Amount')
+                )
+                .properties(height=300)
+            )
+            st.altair_chart(cfc, use_container_width=True)
         else:
-            st.info("Missing coupon or maturity to build cashflows.")
+            st.info("Missing maturity date for cashflow projection.")
 
-    # Download
-    csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download portfolio CSV", data=csv, file_name=f"portfolio_{date.today()}.csv")
+# --- Portfolio totals & download ---
+with st.expander("Totals & Averages", expanded=True):
+    cols = st.columns(4)
+    with cols[0]:
+        st.metric("Total Market Value", f"${out_df['Market_Value'].sum(skipna=True):,.2f}")
+        st.metric("Total Invested", f"${out_df['Invested'].sum(skipna=True):,.2f}")
+    with cols[1]:
+        st.metric("Total $ P/L", f"${out_df['Dollar_PL'].sum(skipna=True):,.2f}")
+        st.metric("Avg % P/L", f"{out_df['Percent_PL'].mean(skipna=True):.2f}%")
+    with cols[2]:
+        st.metric("Avg Purch YTM", f"{out_df['PurchYTM'].mean(skipna=True):.2f}%")
+        st.metric("Avg Bid YTM", f"{out_df['BidYTM'].mean(skipna=True):.2f}%")
+    with cols[3]:
+        st.metric("Portfolio DV01 (per 100)", f"${out_df['DV01'].sum(skipna=True):,.2f}")
+        st.metric("Weighted Duration", f"{np.average(out_df['Duration'].fillna(0), weights=out_df['Market_Value'].fillna(0) + 1e-9):.2f}y")
 
-else:
-    st.warning("No data loaded yet.")
+csv = styled.to_csv(index=False).encode("utf-8")
+st.download_button("Download table as CSV", data=csv, file_name=f"fsl_bond_portfolio_{date.today()}.csv")
 
-st.caption("Note: Metrics are simplified. For advanced yield/duration/convexity analytics, extend with QuantLib.")
+st.caption(
+    "Notes: YTM/Duration/Convexity are approximations for fixed-rate bullet bonds using simple day count and semi-annual coupons. "
+    "For floating-rate/odd coupons, consider enhancing with full analytics (e.g., QuantLib). Margin figures are estimates—configure "
+    "init/maintenance % and borrow rate in the sidebar or wire in IB 'what-if' calculations per bond."
+)

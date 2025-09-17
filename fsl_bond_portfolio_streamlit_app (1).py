@@ -21,6 +21,7 @@ Security note: set IB connection params from environment variables when deployin
 (IB_HOST, IB_PORT, IB_CLIENT_ID). On Streamlit Cloud or your own server, run an
 IB Gateway alongside the app (same private network) so the socket is reachable.
 """
+from __future__ import annotations
 import asyncio
 
 # Create and set a loop before importing ib_insync/eventkit
@@ -32,8 +33,6 @@ except RuntimeError:
 
 from ib_insync import IB, Bond, util
 util.patchAsyncio()
-
-from __future__ import annotations
 
 import math
 import os

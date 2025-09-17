@@ -137,6 +137,12 @@ def safe_weighted_avg(values, weights, default=np.nan):
 
 import altair as alt
 
+# Ensure dataframes exist
+if 'out_df' not in globals():
+    out_df = pd.DataFrame()
+if 'styled' not in globals():
+    styled = out_df.copy()
+
 # Header KPIs
 # Safe numeric helpers for KPIs
 def _num_series(df, col):

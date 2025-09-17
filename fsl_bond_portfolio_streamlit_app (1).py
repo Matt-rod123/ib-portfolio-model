@@ -1,520 +1,230 @@
 """
-Firstline Securities Ltd — Bond Portfolio (Streamlit + IBKR TWS API)
+FSL Fixed Income Portfolio — Streamlit App (Improved UI)
+------------------------------------------------------
 
-How to run locally
-------------------
-1) Python 3.10+
-2) `pip install -r requirements.txt`
-3) Start IB Gateway or Trader Workstation with API enabled.
-4) `streamlit run fsl_bond_portfolio_streamlit_app.py`
+Now presented in a dashboard-style interface with clear cards, charts, and metrics
+instead of a raw spreadsheet-style table.
 
-Minimal requirements.txt (create this file next to the app):
------------------------------------------------------------
-streamlit
-pandas
-numpy
-ib-insync
-openpyxl
-python-dateutil
-
-Security note: set IB connection params from environment variables when deploying
-(IB_HOST, IB_PORT, IB_CLIENT_ID). On Streamlit Cloud or your own server, run an
-IB Gateway alongside the app (same private network) so the socket is reachable.
+Run:
+  streamlit run fsl_bond_portfolio_streamlit_app.py
 """
 from __future__ import annotations
+
+import os
+from datetime import date
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.express as px
+
+from ib_insync import IB, Bond, util
 import asyncio
 
-# Create and set a loop before importing ib_insync/eventkit
+# Ensure event loop exists before ib_insync/eventkit import issues
 try:
     asyncio.get_running_loop()
 except RuntimeError:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-from ib_insync import IB, Bond, util
 util.patchAsyncio()
 
-import math
-import os
-from dataclasses import dataclass, asdict
-from datetime import datetime, date
-from typing import List, Optional, Dict, Any
-
-import numpy as np
-import pandas as pd
-from dateutil.relativedelta import relativedelta
-import streamlit as st
-
 # ----------------------------
-# UI CONFIG
+# CONFIG
 # ----------------------------
-st.set_page_config(
-    page_title="FSL Fixed Income Portfolio",
-    page_icon="📈",
-    layout="wide",
-)
-
-# ----------------------------
-# HELPERS — FINANCE MATH
-# ----------------------------
-
-def yearfrac(d1: date, d2: date, basis: str = "30/360") -> float:
-    """Approximate year fraction between two dates.
-    Supports 'act/365' and '30/360' conventions (simple versions).
-    """
-    if basis.lower() in {"act/365", "actual/365"}:
-        return (d2 - d1).days / 365.0
-    # 30/360 US (simplified)
-    d1_day = min(d1.day, 30)
-    d2_day = 30 if (d1.day == 31 and d2.day == 31) else min(d2.day, 30)
-    months = (d2.year - d1.year) * 12 + (d2.month - d1.month)
-    days = d2_day - d1_day
-    return (months * 30 + days) / 360.0
-
-
-def cashflow_schedule(maturity: date, coupon: float, freq: int, face: float, settle: date) -> List[Dict[str, Any]]:
-    """Generate fixed coupon cashflows from next coupon after settle to maturity.
-    coupon in decimal (e.g., 0.065 for 6.5%). face nominal per *unit*.
-    """
-    if freq not in [1, 2, 4]:
-        freq = 2
-    # Assume standard semi-annual timeline ending at maturity
-    # Roll back coupons until strictly greater than settle
-    cf = []
-    pay = maturity
-    step = {1: relativedelta(years=1), 2: relativedelta(months=6), 4: relativedelta(months=3)}[freq]
-    while pay > settle:
-        cf.append({"date": pay, "amount": face * coupon / freq})
-        pay = pay - step
-    cf = list(reversed(cf))
-    if cf and cf[-1]["date"] == maturity:
-        cf[-1]["amount"] += face  # add principal at maturity
-    else:
-        # if no coupon dates (very short), just principal at maturity
-        cf.append({"date": maturity, "amount": face * (1 + coupon / freq)})
-    return cf
-
-
-def price_from_ytm(ytm: float, maturity: date, coupon: float, freq: int, face: float, settle: date) -> float:
-    """Clean price per 100 face given YTM (annual, in decimal)."""
-    cfs = cashflow_schedule(maturity, coupon, freq, face, settle)
-    pv = 0.0
-    for c in cfs:
-        t = yearfrac(settle, c["date"], "act/365")
-        pv += c["amount"] / ((1 + ytm / freq) ** (freq * t))
-    return pv / (face / 100.0)
-
-
-def ytm_from_price(clean_price: float, maturity: date, coupon: float, freq: int, face: float, settle: date) -> float:
-    """Solve for YTM (decimal, annual) from clean price per 100 face using Newton's method."""
-    if clean_price <= 0:
-        return np.nan
-    # Initial guess ~ coupon/price
-    y = max(0.0001, coupon / max(0.01, clean_price / 100.0))
-    for _ in range(40):
-        p = price_from_ytm(y, maturity, coupon, freq, face, settle)
-        # numeric derivative
-        dy = 1e-6
-        p2 = price_from_ytm(y + dy, maturity, coupon, freq, face, settle)
-        dpdy = (p2 - p) / dy
-        if abs(dpdy) < 1e-8:
-            break
-        y_new = y - (p - clean_price) / dpdy
-        if abs(y_new - y) < 1e-10:
-            return max(y_new, 0.0)
-        y = max(y_new, 0.0)
-    return max(y, 0.0)
-
-
-def macaulay_duration_convexity(ytm: float, maturity: date, coupon: float, freq: int, face: float, settle: date) -> tuple[float, float]:
-    """Return (ModifiedDuration, Convexity) in years. DV01 per 100 face = ModDur * Price / 100."""
-    cfs = cashflow_schedule(maturity, coupon, freq, face, settle)
-    md = 0.0
-    cx = 0.0
-    pv = 0.0
-    for c in cfs:
-        t = yearfrac(settle, c["date"], "act/365")
-        disc = (1 + ytm / freq) ** (freq * t)
-        pv_c = c["amount"] / disc
-        pv += pv_c
-        tau = t
-        md += tau * pv_c
-        cx += tau * (tau + 1 / freq) * pv_c  # approximation
-    if pv == 0:
-        return (np.nan, np.nan)
-    macaulay = md / pv
-    modified = macaulay / (1 + ytm / freq)
-    convexity = cx / (pv * (1 + ytm / freq) ** 2)
-    return modified, convexity
-
-
-# ----------------------------
-# DATA CLASSES
-# ----------------------------
-@dataclass
-class BondRow:
-    RIC: Optional[str] = None
-    Issuer: Optional[str] = None
-    Security: Optional[str] = None
-    ISIN: Optional[str] = None
-    Account: Optional[str] = None
-    Allocation: Optional[str] = None
-    Face_Value: float = 0.0
-    Units: float = 0.0
-    Purchase_Px: float = np.nan  # clean px / 100
-    Invested: float = np.nan
-    Close_Bid: float = np.nan
-
-    # P&L block
-    Market_Value: float = np.nan
-    Dollar_PL: float = np.nan
-    Percent_PL: float = np.nan
-
-    # Yield/coupon block
-    Mrgn_Cost: float = np.nan
-    PurchYTM: float = np.nan
-    PYTM_Sprd: float = np.nan
-    BidYTM: float = np.nan
-    Current_Yld: float = np.nan
-    Curr_Sprd: float = np.nan
-    Coupon: float = np.nan
-    Cpn_Sprd: float = np.nan
-    Init_Margin_Pct: float = 0.25  # default 25%
-    I_Cash_Equity: float = np.nan
-
-    # Margin details
-    I_Margined: float = np.nan
-    Marg_Int: float = np.nan
-    Mnt_Margin: float = np.nan
-
-    # Risk
-    Duration: float = np.nan
-    Convexity: float = np.nan
-    DV01: float = np.nan
-
-    # Dates
-    Maturity_Date: Optional[date] = None
-    Days_to_Maturity: Optional[int] = None
-    Mat_Year: Optional[int] = None
-    Cpn_Date_1: Optional[str] = None
-    Cpn_Date_2: Optional[str] = None
-
+st.set_page_config(page_title="FSL Bond Portfolio", page_icon="📊", layout="wide")
 
 # ----------------------------
 # IB CONNECTION
 # ----------------------------
 @st.cache_resource(show_spinner=False)
 def get_ib() -> IB:
-    # Double patch for safety in some hosting envs
     util.patchAsyncio()
-    ib = IB()
-    return ib
+    return IB()
 
+ib = get_ib()
 
-def ensure_connected(ib: IB, host: str, port: int, client_id: int) -> bool:
-    if ib.isConnected():
-        return True
-    try:
-        ib.connect(host, port, clientId=client_id, readonly=True, timeout=5)
-        return True
-    except Exception as e:
-        st.warning(f"Could not connect to IBKR TWS/Gateway: {e}")
-        return False
-
-
-# ----------------------------
-# MARKET DATA FETCH
-# ----------------------------
-@st.cache_data(show_spinner=False, ttl=30)
-def fetch_bid_and_contract(ib: IB, isin: Optional[str]) -> tuple[Optional[float], Optional[Bond]]:
-    if not isin:
-        return (None, None)
-    contract = Bond(secIdType="ISIN", secId=isin)
-    try:
-        qualified = ib.qualifyContracts(contract)
-        if not qualified:
-            return (None, None)
-        c = qualified[0]
-        ticker = ib.reqMktData(c, genericTickList="", snapshot=True)
-        ib.sleep(0.5)
-        bid = ticker.bid if not math.isnan(ticker.bid or float('nan')) else None
-        # fallback to last / close
-        if bid is None:
-            last = None if math.isnan(ticker.last or float('nan')) else ticker.last
-            close = None if math.isnan(ticker.close or float('nan')) else ticker.close
-            bid = last or close
-        return (bid, c)
-    except Exception:
-        return (None, None)
-
-
-# ----------------------------
-# PORTFOLIO PIPELINE
-# ----------------------------
-REQUIRED_COLUMNS = [
-    "RIC", "Issuer", "Security", "ISIN", "Account", "Allocation",
-    "Face Value", "Units", "Purchase Px", "Invested", "Close Bid",
-    # Optional analytics inputs
-    "Coupon", "Mat. Year", "Maturity Date", "Cpn Date 1", "Cpn Date 2", "Init Margin %",
-]
-
-COLUMN_RENAMES = {
-    "Face Value": "Face_Value",
-    "Purchase Px": "Purchase_Px",
-    "Close Bid": "Close_Bid",
-    "Init Margin %": "Init_Margin_Pct",
-    "Maturity Date": "Maturity_Date",
-    "Cpn Date 1": "Cpn_Date_1",
-    "Cpn Date 2": "Cpn_Date_2",
-}
-
-
-def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    # Standardize column names
-    for old, new in COLUMN_RENAMES.items():
-        if old in df.columns:
-            df.rename(columns={old: new}, inplace=True)
-    # Ensure expected columns exist
-    for c in [c for c in BondRow.__dataclass_fields__.keys() if c not in df.columns]:
-        df[c] = np.nan
-    # Coerce numeric
-    num_cols = [
-        "Face_Value", "Units", "Purchase_Px", "Invested", "Close_Bid", "Coupon",
-        "Init_Margin_Pct",
-    ]
-    for c in num_cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    # Dates
-    if "Maturity_Date" in df.columns:
-        df["Maturity_Date"] = pd.to_datetime(df["Maturity_Date"], errors="coerce").dt.date
-    if "Mat_Year" in df.columns:
-        df["Mat_Year"] = pd.to_numeric(df["Mat_Year"], errors="coerce").astype("Int64")
-    return df
-
-
-def compute_row_metrics(row: pd.Series, ib: Optional[IB], live_prices: bool, maint_margin_pct: float, borrow_rate: float) -> Dict[str, Any]:
-    data = BondRow(**{k: row.get(k) for k in BondRow.__dataclass_fields__.keys()})
-
-    # Pull live bid if requested (fallback to spreadsheet value)
-    bid_px = float(row.get("Close_Bid")) if not np.isnan(row.get("Close_Bid", np.nan)) else None
-    contract = None
-    if live_prices and ib is not None and row.get("ISIN"):
-        live_bid, contract = fetch_bid_and_contract(ib, row.get("ISIN"))
-        if live_bid is not None:
-            bid_px = live_bid * 100 if live_bid < 2 else live_bid  # IB may return in % or raw
-    data.Close_Bid = bid_px
-
-    # Face per unit assumed = 100 unless explicitly provided via Face_Value/Units
-    face_per_unit = 100.0
-    units = float(row.get("Units") or 0.0)
-    face_val = float(row.get("Face_Value") or (units * face_per_unit))
-
-    # Invested default = units * purchase_px
-    purch_px = float(row.get("Purchase_Px") or np.nan)
-    invested = row.get("Invested")
-    if pd.isna(invested) and not np.isnan(purch_px):
-        invested = units * purch_px
-
-    data.Face_Value = face_val
-    data.Units = units
-    data.Purchase_Px = purch_px
-    data.Invested = invested
-
-    # Market value
-    if bid_px is not None and not np.isnan(bid_px):
-        mv = units * bid_px
-        data.Market_Value = mv
-        if invested is not None and not np.isnan(invested):
-            data.Dollar_PL = mv - invested
-            data.Percent_PL = (data.Dollar_PL / invested) * 100 if invested else np.nan
-
-    # Coupon/Yield block
-    coupon = float(row.get("Coupon") or (getattr(contract, "coupon", None) or np.nan))
-    if not np.isnan(coupon):
-        coupon_dec = coupon / 100.0 if coupon > 1.0 else coupon
-    else:
-        coupon_dec = np.nan
-
-    maturity = row.get("Maturity_Date")
-    if pd.isna(maturity) or maturity is None:
-        # Try Mat_Year + Cpn Date 2 (assume last coupon in year)
-        mat_year = row.get("Mat_Year")
-        if pd.notna(mat_year):
-            maturity = date(int(mat_year), 12, 31)
-    settle = date.today()
-
-    freq = 2  # default semi-annual
-    if not np.isnan(coupon_dec) and not pd.isna(maturity):
-        # Compute BidYTM from bid price per 100
-        if bid_px is not None and not np.isnan(bid_px):
-            data.BidYTM = ytm_from_price(bid_px, maturity, coupon_dec, freq, 100, settle) * 100
-        # PurchYTM from purchase price
-        if not np.isnan(purch_px):
-            data.PurchYTM = ytm_from_price(purch_px, maturity, coupon_dec, freq, 100, settle) * 100
-        if not np.isnan(data.PurchYTM) and not np.isnan(data.BidYTM):
-            data.PYTM_Sprd = data.BidYTM - data.PurchYTM
-        # Current yield ≈ coupon / price
-        if bid_px is not None and not np.isnan(bid_px):
-            data.Current_Yld = (coupon_dec * 100) / (bid_px / 100)
-        # Spreads relative to coupon
-        data.Cpn_Sprd = (data.BidYTM - (coupon_dec * 100)) if not np.isnan(data.BidYTM) else np.nan
-        data.Curr_Sprd = (data.Current_Yld - (coupon_dec * 100)) if not np.isnan(data.Current_Yld) else np.nan
-        # Risk metrics
-        if not np.isnan(data.BidYTM):
-            mdur, conv = macaulay_duration_convexity(data.BidYTM / 100.0, maturity, coupon_dec, freq, 100, settle)
-            data.Duration = mdur
-            data.Convexity = conv
-            if bid_px is not None and not np.isnan(bid_px):
-                data.DV01 = mdur * (bid_px) / 100.0
-
-    data.Coupon = coupon if not np.isnan(coupon) else np.nan
-
-    # Days to maturity
-    if maturity:
-        data.Maturity_Date = maturity
-        data.Days_to_Maturity = (maturity - settle).days
-        data.Mat_Year = maturity.year
-
-    # Margin block (approx, configurable)
-    init_pct = float(row.get("Init_Margin_Pct") or 0.25)
-    data.Init_Margin_Pct = init_pct * 100 if init_pct < 1 else init_pct
-    init_pct_dec = init_pct if init_pct < 1 else init_pct / 100.0
-    maint_pct_dec = maint_margin_pct
-
-    if not np.isnan(data.Market_Value):
-        data.I_Cash_Equity = data.Market_Value * init_pct_dec
-        data.I_Margined = data.Market_Value * init_pct_dec
-        data.Mnt_Margin = data.Market_Value * maint_pct_dec
-        # Simple daily interest estimate on margined amount
-        data.Marg_Int = data.I_Margined * (borrow_rate / 100.0) / 360.0
-
-    # Return dict for DataFrame assembly
-    out = asdict(data)
-    return out
-
-
-# ----------------------------
-# SIDEBAR & INPUTS
-# ----------------------------
+# Sidebar
 st.sidebar.header("IBKR Connection")
 ib_host = st.sidebar.text_input("Host", os.getenv("IB_HOST", "127.0.0.1"))
 ib_port = st.sidebar.number_input("Port", value=int(os.getenv("IB_PORT", "7497")))
 ib_client = st.sidebar.number_input("Client ID", value=int(os.getenv("IB_CLIENT_ID", "1101")))
-connect_btn = st.sidebar.button("Connect to IBKR")
+connect_btn = st.sidebar.button("Connect")
 
-st.sidebar.header("Analytics Settings")
-live_prices = st.sidebar.toggle("Use live IBKR bid prices", value=True)
-maint_margin_pct = st.sidebar.slider("Maintenance Margin % (estimate)", 0.05, 0.5, 0.25, 0.01)
-borrow_rate = st.sidebar.number_input("Borrow Rate % p.a. (estimate)", value=8.0, step=0.25)
-
-ib = get_ib()
 if connect_btn:
-    ensure_connected(ib, ib_host, ib_port, ib_client)
-
-if ib.isConnected():
-    st.sidebar.success("Connected to IBKR")
-else:
-    st.sidebar.info("Not connected. The app can still run from spreadsheet values.")
+    try:
+        ib.connect(ib_host, ib_port, clientId=ib_client, readonly=True, timeout=5)
+        st.sidebar.success("Connected to IBKR")
+    except Exception as e:
+        st.sidebar.error(f"Could not connect: {e}")
 
 # ----------------------------
-# MAIN: INPUT TABLE
+# MAIN APP
 # ----------------------------
-st.title("FIRSTLINE SECURITIES LTD — Fixed Income Portfolio")
-st.caption("Live model reflecting your Excel template. Upload the sheet and (optionally) pull live prices from IBKR.")
+st.title("📈 Firstline Securities Ltd — Bond Portfolio")
+st.caption("A clearer dashboard view of your fixed income portfolio with IBKR live data.")
 
-uploaded = st.file_uploader("Upload Excel/CSV based on template", type=["xlsx", "xls", "csv"])
-
+# Upload
+uploaded = st.file_uploader("Upload portfolio file (Excel/CSV)", type=["xlsx", "xls", "csv"])
 if uploaded is not None:
     if uploaded.name.lower().endswith("csv"):
-        raw_df = pd.read_csv(uploaded)
+        df = pd.read_csv(uploaded)
     else:
-        raw_df = pd.read_excel(uploaded, engine="openpyxl")
+        df = pd.read_excel(uploaded)
 else:
-    st.info("No file uploaded yet. You can still see an empty table below.")
-    raw_df = pd.DataFrame(columns=REQUIRED_COLUMNS)
+    st.info("Upload a file to get started.")
+    df = pd.DataFrame(columns=["Issuer","Security","ISIN","Units","Purchase Px","Close Bid","Coupon","Maturity Date"])
 
-# Normalize columns
-in_df = normalize_input(raw_df)
+# Simple portfolio calculations
+if not df.empty:
+    df["Invested"] = df["Units"] * df["Purchase Px"]
+    df["Market Value"] = df["Units"] * df["Close Bid"]
+    df["P/L $"] = df["Market Value"] - df["Invested"]
+    df["P/L %"] = (df["P/L $"] / df["Invested"]) * 100
 
-# Compute metrics row by row
-rows = []
-for _, r in in_df.iterrows():
-    rows.append(
-        compute_row_metrics(r, ib if ib.isConnected() else None, live_prices, maint_margin_pct, borrow_rate)
+    # Top-level KPIs
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Total Invested", f"${df['Invested'].sum():,.2f}")
+    with c2:
+        st.metric("Market Value", f"${df['Market Value'].sum():,.2f}")
+    with c3:
+        st.metric("Total P/L", f"${df['P/L $'].sum():,.2f}", f"{df['P/L %'].mean():.2f}%")
+    with c4:
+        st.metric("# Holdings", len(df))
+
+    st.divider()
+
+    # Portfolio composition
+    st.subheader("Portfolio Breakdown")
+    if "Issuer" in df.columns:
+        fig = px.pie(df, names="Issuer", values="Market Value", title="Market Value by Issuer")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Table view
+    st.subheader("Holdings")
+    show_cols = ["Issuer","Security","ISIN","Units","Purchase Px","Close Bid","Invested","Market Value","P/L $","P/L %"]
+    with st.expander("Raw table (optional)", expanded=False):
+    st.dataframe(
+        styled,
+        use_container_width=True,
+        height=500,
     )
 
-out_df = pd.DataFrame(rows)
+# === Nicer UI ===
+import altair as alt
 
-# Presentation — order columns to mirror your screenshots
-ORDERED_COLUMNS = [
-    # Block 1
-    "RIC", "Issuer", "Security", "ISIN", "Account", "Allocation",
-    "Face_Value", "Units", "Purchase_Px", "Invested", "Close_Bid",
-    # Block 2
-    "Market_Value", "Dollar_PL", "Percent_PL", "Mrgn_Cost", "PurchYTM", "PYTM_Sprd",
-    "BidYTM", "Current_Yld", "Curr_Sprd", "Coupon", "Cpn_Sprd", "Init_Margin_Pct", "I_Cash_Equity",
-    # Block 3
-    "I_Margined", "Marg_Int", "Mnt_Margin", "Duration", "Convexity", "DV01",
-    "Maturity_Date", "Days_to_Maturity", "Mat_Year", "Cpn_Date_1", "Cpn_Date_2",
-]
+# Header KPIs
+colK1, colK2, colK3, colK4 = st.columns(4)
+with colK1:
+    st.metric("Total Market Value", f"${out_df['Market_Value'].sum(skipna=True):,.2f}")
+with colK2:
+    st.metric("Total $ P/L", f"${out_df['Dollar_PL'].sum(skipna=True):,.2f}")
+with colK3:
+    st.metric("Avg Bid YTM", f"{out_df['BidYTM'].mean(skipna=True):.2f}%")
+with colK4:
+    st.metric("Weighted Duration", f"{np.average(out_df['Duration'].fillna(0), weights=out_df['Market_Value'].fillna(0) + 1e-9):.2f}y")
 
-# Ensure columns exist
-for c in ORDERED_COLUMNS:
-    if c not in out_df.columns:
-        out_df[c] = np.nan
+# Filters
+st.subheader("Filters")
+fc1, fc2, fc3 = st.columns(3)
+all_issuers = sorted([x for x in out_df['Issuer'].dropna().unique()])
+all_accounts = sorted([x for x in out_df['Account'].dropna().unique()])
+all_allocs = sorted([x for x in out_df['Allocation'].dropna().unique()])
+sel_issuer = fc1.multiselect("Issuer", all_issuers)
+sel_account = fc2.multiselect("Account", all_accounts)
+sel_alloc = fc3.multiselect("Allocation", all_allocs)
 
-# Formatting helpers
-money_cols = [
-    "Face_Value", "Units", "Purchase_Px", "Invested", "Close_Bid", "Market_Value",
-    "Dollar_PL", "I_Cash_Equity", "I_Margined", "Marg_Int", "Mnt_Margin", "DV01",
-]
-percent_cols = ["Percent_PL", "PurchYTM", "PYTM_Sprd", "BidYTM", "Current_Yld", "Curr_Sprd", "Coupon", "Cpn_Sprd", "Init_Margin_Pct"]
-int_cols = ["Days_to_Maturity", "Mat_Year"]
+mask = pd.Series(True, index=out_df.index)
+if sel_issuer:
+    mask &= out_df['Issuer'].isin(sel_issuer)
+if sel_account:
+    mask &= out_df['Account'].isin(sel_account)
+if sel_alloc:
+    mask &= out_df['Allocation'].isin(sel_alloc)
+flt = out_df[mask].copy()
 
-styled = out_df[ORDERED_COLUMNS].copy()
+# Tabs
+tab1, tab2, tab3, tab4 = st.tabs(["Overview", "Holdings", "Risk", "Cashflows"])
 
-# Apply formats
-for c in money_cols:
-    if c in styled.columns:
-        styled[c] = styled[c].map(lambda x: np.nan if pd.isna(x) else round(float(x), 2))
-for c in percent_cols:
-    if c in styled.columns:
-        styled[c] = styled[c].map(lambda x: np.nan if pd.isna(x) else round(float(x), 2))
-for c in int_cols:
-    if c in styled.columns:
-        styled[c] = styled[c].astype("Int64")
+with tab1:
+    st.caption("Portfolio overview & breakdowns")
+    # Allocation by account (bar)
+    alloc_df = flt.groupby('Account', dropna=False)['Market_Value'].sum().reset_index().sort_values('Market_Value', ascending=False)
+    chart1 = alt.Chart(alloc_df).mark_bar().encode(x=alt.X('Market_Value:Q', title='Market Value ($)'), y=alt.Y('Account:N', sort='-x'), tooltip=['Account','Market_Value']).properties(height=300)
+    st.altair_chart(chart1, use_container_width=True)
 
-# Display
-st.dataframe(
-    styled,
-    use_container_width=True,
-    height=650,
-)
+    # Maturity ladder by year
+    mat = flt.dropna(subset=['Maturity_Date']).copy()
+    if not mat.empty:
+        mat['Year'] = pd.to_datetime(mat['Maturity_Date']).dt.year
+        ladder = mat.groupby('Year')['Market_Value'].sum().reset_index()
+        chart2 = alt.Chart(ladder).mark_bar().encode(x=alt.X('Year:O'), y=alt.Y('Market_Value:Q', title='Market Value ($)'), tooltip=['Year','Market_Value']).properties(height=300)
+        st.altair_chart(chart2, use_container_width=True)
 
-# Portfolio totals (bottom bar like in the screenshots)
-with st.expander("Totals & Averages", expanded=True):
-    cols = st.columns(4)
-    with cols[0]:
-        st.metric("Total Market Value", f"${out_df['Market_Value'].sum(skipna=True):,.2f}")
-        st.metric("Total Invested", f"${out_df['Invested'].sum(skipna=True):,.2f}")
-    with cols[1]:
-        st.metric("Total $ P/L", f"${out_df['Dollar_PL'].sum(skipna=True):,.2f}")
-        st.metric("Avg % P/L", f"{out_df['Percent_PL'].mean(skipna=True):.2f}%")
-    with cols[2]:
-        st.metric("Avg Purch YTM", f"{out_df['PurchYTM'].mean(skipna=True):.2f}%")
-        st.metric("Avg Bid YTM", f"{out_df['BidYTM'].mean(skipna=True):.2f}%")
-    with cols[3]:
-        st.metric("Portfolio DV01 (per 100)", f"${out_df['DV01'].sum(skipna=True):,.2f}")
-        st.metric("Weighted Duration", f"{np.average(out_df['Duration'].fillna(0), weights=out_df['Market_Value'].fillna(0) + 1e-9):.2f}y")
+    # YTM histogram
+    ytms = flt['BidYTM'].dropna()
+    if not ytms.empty:
+        hist = pd.DataFrame({'BidYTM': ytms})
+        chart3 = alt.Chart(hist).mark_bar().encode(alt.X('BidYTM:Q', bin=alt.Bin(maxbins=30), title='Bid YTM (%)'), y='count()').properties(height=300)
+        st.altair_chart(chart3, use_container_width=True)
 
-# Download
-csv = styled.to_csv(index=False).encode("utf-8")
-st.download_button("Download table as CSV", data=csv, file_name=f"fsl_bond_portfolio_{date.today()}.csv")
+with tab2:
+    st.caption("Clean holdings table with key columns and quick selection.")
+    nice_cols = ['Issuer','Security','ISIN','Account','Allocation','Units','Purchase_Px','Close_Bid','Market_Value','Dollar_PL','Percent_PL','PurchYTM','BidYTM','Duration','DV01','Maturity_Date']
+    view = flt[nice_cols].copy()
+    # Pretty labels
+    labels = {
+        'Purchase_Px':'Purchase Px','Close_Bid':'Bid Px','Market_Value':'Market Value',
+        'Dollar_PL':'$ P/L','Percent_PL':'% P/L','PurchYTM':'Purch YTM','BidYTM':'Bid YTM',
+        'Maturity_Date':'Maturity','DV01':'DV01 (per 100)'
+    }
+    view.rename(columns=labels, inplace=True)
+    st.dataframe(view, hide_index=True, use_container_width=True)
 
-st.caption(
-    "Notes: YTM/Duration/Convexity are approximations for fixed-rate bullet bonds using simple day count and semi-annual coupons. "
-    "For floating-rate/odd coupons, consider enhancing with full analytics (e.g., QuantLib). Margin figures are estimates—configure "
-    "init/maintenance % and borrow rate in the sidebar or wire in IB 'what-if' calculations per bond."
-)
+    # Select a bond for details
+    st.markdown("### Bond details")
+    options = (flt['Issuer'].fillna('') + ' — ' + flt['Security'].fillna('') + ' (' + flt['ISIN'].fillna('') + ')').tolist()
+    idx_map = {opt:i for i,opt in enumerate(options)}
+    choice = st.selectbox("Choose a bond", options) if options else None
+    if choice:
+        r = flt.iloc[idx_map[choice]].to_dict()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Bid Px", f"{r.get('Close_Bid', float('nan')):,.2f}")
+        c2.metric("Bid YTM", f"{r.get('BidYTM', float('nan')):,.2f}%")
+        c3.metric("Duration", f"{r.get('Duration', float('nan')):,.2f}y")
+        st.write({k: r.get(k) for k in ['Issuer','Security','ISIN','Account','Allocation','Units','Coupon','Maturity_Date','Days_to_Maturity']})
+
+with tab3:
+    st.caption("Risk lenses: DV01 and duration by holding.")
+    risk = flt[['Issuer','Security','ISIN','Market_Value','Duration','DV01']].dropna(subset=['DV01']).copy()
+    if not risk.empty:
+        risk['AbsDV01'] = risk['DV01'] * risk['Market_Value'].fillna(0) / 100.0
+        st.dataframe(risk.sort_values('AbsDV01', ascending=False), hide_index=True, use_container_width=True)
+        rchart = alt.Chart(risk).mark_bar().encode(x=alt.X('AbsDV01:Q', title='Portfolio DV01 ($ per 1bp)'), y=alt.Y('Security:N', sort='-x'), tooltip=['ISIN','AbsDV01']).properties(height=400)
+        st.altair_chart(rchart, use_container_width=True)
+    else:
+        st.info("No risk data available.")
+
+with tab4:
+    st.caption("Projected fixed-coupon cashflows for a selected bond.")
+    options2 = (flt['Issuer'].fillna('') + ' — ' + flt['Security'].fillna('') + ' (' + flt['ISIN'].fillna('') + ')').tolist()
+    pick = st.selectbox("Bond", options2, key='cf_pick') if options2 else None
+    if pick:
+        r = flt.iloc[idx_map[pick]]
+        coupon_dec = (r['Coupon']/100.0) if (pd.notna(r['Coupon']) and r['Coupon']>1) else r['Coupon']
+        cf = cashflow_schedule(r['Maturity_Date'], coupon_dec if pd.notna(coupon_dec) else 0.0, 2, 100, date.today()) if pd.notna(r['Maturity_Date']) else []
+        if cf:
+            cf_df = pd.DataFrame(cf)
+            st.dataframe(cf_df, hide_index=True, use_container_width=True)
+        else:
+            st.info("Missing coupon or maturity to build cashflows.")
+
+    # Download
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button("Download portfolio CSV", data=csv, file_name=f"portfolio_{date.today()}.csv")
+
+else:
+    st.warning("No data loaded yet.")
+
+st.caption("Note: Metrics are simplified. For advanced yield/duration/convexity analytics, extend with QuantLib.")

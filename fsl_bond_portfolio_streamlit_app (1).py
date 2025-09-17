@@ -141,4 +141,158 @@ def ib_positions_df() -> pd.DataFrame:
         # Compute
         invested = qty * avg_cost if (qty and not np.isnan(avg_cost)) else np.nan
         mval = qty * bid_px if (qty and not np.isnan(bid_px)) else np.nan
-        dpl = (mval - invested) if (not np.isnan(m
+        dpl = (mval - invested) if (not np.isnan(mval) and not np.isnan(invested)) else np.nan
+        ppl = (dpl / invested * 100.0) if (not np.isnan(dpl) and invested and invested != 0) else np.nan
+        rows.append({
+            'Issuer': issuer,
+            'Security': getattr(con, 'localSymbol', '') or getattr(con, 'description', '') or '',
+            'ISIN': isin,
+            'Account': account,
+            'Allocation': '',
+            'Units': qty,
+            'Purchase_Px': avg_cost,
+            'Close_Bid': bid_px,
+            'Invested': invested,
+            'Market_Value': mval,
+            'Dollar_PL': dpl,
+            'Percent_PL': ppl,
+            'Coupon': coupon,
+            'Maturity_Date': maturity,
+            # Placeholders for analytics not computed here
+            'Duration': np.nan,
+            'DV01': np.nan,
+            'BidYTM': np.nan,
+            'PurchYTM': np.nan,
+        })
+    df = pd.DataFrame(rows)
+    return df
+
+# Decide source (IB preferred)
+if ib.isConnected():
+    df_main = ib_positions_df()
+    if df_main.empty:
+        st.warning("Connected to IBKR but no bond positions were returned.")
+elif 'df_upload' in locals() and df_upload is not None:
+    df_main = df_upload.copy()
+    st.info("Using uploaded file (IB not connected).")
+else:
+    df_main = pd.DataFrame()
+    st.info("Connect to IBKR to load positions, or use Advanced import.")
+
+# Guarantee columns
+needed = ['Issuer','Security','ISIN','Account','Allocation','Units','Purchase_Px','Close_Bid','Invested','Market_Value','Dollar_PL','Percent_PL','Coupon','Maturity_Date','Duration','DV01','BidYTM','PurchYTM']
+for c in needed:
+    if c not in df_main.columns:
+        df_main[c] = np.nan
+
+# --- KPIs ---------------------------------------------------------------------
+
+def _num_series(df, col):
+    s = df[col] if col in df.columns else pd.Series(dtype=float)
+    return pd.to_numeric(s, errors='coerce')
+
+def fmt_money(x):
+    return "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"${x:,.2f}"
+
+def fmt_pct(x):
+    return "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x:.2f}%"
+
+mv_s = _num_series(df_main, 'Market_Value')
+pl_s = _num_series(df_main, 'Dollar_PL')
+colK1, colK2, colK3, colK4 = st.columns(4)
+colK1.metric("Total Invested", fmt_money(float(_num_series(df_main,'Invested').sum()) if not df_main.empty else float('nan')))
+colK2.metric("Market Value", fmt_money(float(mv_s.sum()) if not df_main.empty else float('nan')))
+colK3.metric("Total P/L", fmt_money(float(pl_s.sum()) if not df_main.empty else float('nan')))
+colK4.metric("# Holdings", int(df_main.shape[0]))
+
+st.divider()
+
+# --- Filters ------------------------------------------------------------------
+
+def col_values(df: pd.DataFrame, col: str):
+    if col in df.columns:
+        vals = pd.Series(df[col]).dropna().astype(str)
+        vals = [v for v in vals.tolist() if v.strip() != ""]
+        return sorted(vals)
+    return []
+
+fc1, fc2, fc3 = st.columns(3)
+sel_issuer = fc1.multiselect("Issuer", col_values(df_main,'Issuer'))
+sel_account = fc2.multiselect("Account", col_values(df_main,'Account'))
+sel_alloc = fc3.multiselect("Allocation", col_values(df_main,'Allocation'))
+
+mask = pd.Series(True, index=df_main.index)
+if sel_issuer and 'Issuer' in df_main.columns:
+    mask &= df_main['Issuer'].astype(str).isin(sel_issuer)
+if sel_account and 'Account' in df_main.columns:
+    mask &= df_main['Account'].astype(str).isin(sel_account)
+if sel_alloc and 'Allocation' in df_main.columns:
+    mask &= df_main['Allocation'].astype(str).isin(sel_alloc)
+flt = df_main[mask].copy()
+
+# --- Tabs ---------------------------------------------------------------------
+import altair as alt
+
+tab1, tab2, tab3 = st.tabs(["Overview", "Holdings", "Risk"])
+
+with tab1:
+    st.caption("Portfolio overview & breakdowns")
+    # Allocation by account
+    if 'Account' in flt.columns and 'Market_Value' in flt.columns and not flt.empty:
+        alloc_df = flt.groupby('Account', dropna=False)['Market_Value'].sum().reset_index().sort_values('Market_Value', ascending=False)
+        if not alloc_df.empty:
+            chart1 = alt.Chart(alloc_df).mark_bar().encode(
+                x=alt.X('Market_Value:Q', title='Market Value ($)'),
+                y=alt.Y('Account:N', sort='-x'),
+                tooltip=['Account','Market_Value']
+            ).properties(height=300)
+            st.altair_chart(chart1, use_container_width=True)
+        else:
+            st.info("No holdings to plot by account.")
+    else:
+        st.info("No account data available.")
+
+    # Maturity ladder by year
+    if 'Maturity_Date' in flt.columns and not flt['Maturity_Date'].dropna().empty:
+        mat = flt.dropna(subset=['Maturity_Date']).copy()
+        mat['Year'] = pd.to_datetime(mat['Maturity_Date']).dt.year
+        ladder = mat.groupby('Year')['Market_Value'].sum().reset_index()
+        chart2 = alt.Chart(ladder).mark_bar().encode(
+            x=alt.X('Year:O'),
+            y=alt.Y('Market_Value:Q', title='Market Value ($)'),
+            tooltip=['Year','Market_Value']
+        ).properties(height=300)
+        st.altair_chart(chart2, use_container_width=True)
+    else:
+        st.info("No maturity data available.")
+
+with tab2:
+    st.caption("Holdings (live from IBKR when connected)")
+    nice_cols = ['Issuer','Security','ISIN','Account','Allocation','Units','Purchase_Px','Close_Bid','Invested','Market_Value','Dollar_PL','Percent_PL','Coupon','Maturity_Date']
+    for c in nice_cols:
+        if c not in flt.columns:
+            flt[c] = np.nan
+    view = flt[nice_cols].copy()
+    view.rename(columns={
+        'Purchase_Px':'Purchase Px','Close_Bid':'Bid Px','Market_Value':'Market Value',
+        'Dollar_PL':'$ P/L','Percent_PL':'% P/L','Maturity_Date':'Maturity'
+    }, inplace=True)
+    st.dataframe(view, hide_index=True, use_container_width=True)
+
+with tab3:
+    st.caption("Risk lenses: DV01 and Duration (placeholders unless analytics added)")
+    if 'DV01' in flt.columns and flt['DV01'].notna().any():
+        risk = flt[['Issuer','Security','ISIN','Market_Value','Duration','DV01']].dropna(subset=['DV01']).copy()
+        risk['AbsDV01'] = risk['DV01'] * risk['Market_Value'].fillna(0) / 100.0
+        st.dataframe(risk.sort_values('AbsDV01', ascending=False), hide_index=True, use_container_width=True)
+        rchart = alt.Chart(risk).mark_bar().encode(
+            x=alt.X('AbsDV01:Q', title='Portfolio DV01 ($ per 1bp)'),
+            y=alt.Y('Security:N', sort='-x'),
+            tooltip=['ISIN','AbsDV01']
+        ).properties(height=400)
+        st.altair_chart(rchart, use_container_width=True)
+    else:
+        st.info("DV01/Duration not computed in this build.")
+
+# Footer
+st.caption("Data source priority: IBKR positions when connected; optional file import is hidden above. Prices are snapshots; some bonds may need manual qualification for quotes.")

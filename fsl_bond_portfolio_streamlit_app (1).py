@@ -104,14 +104,8 @@ if not df.empty:
     # Table view
     st.subheader("Holdings")
     show_cols = ["Issuer","Security","ISIN","Units","Purchase Px","Close Bid","Invested","Market Value","P/L $","P/L %"]
-    with st.expander("Raw table (optional)", expanded=False):
-    st.dataframe(
-        styled,
-        use_container_width=True,
-        height=500,
-    )
+    # === Nicer UI ===
 
-# === Nicer UI ===
 import altair as alt
 
 # Header KPIs
